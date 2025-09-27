@@ -1,0 +1,13 @@
+langchain
+ipykernel
+langchain_community
+langchain-text-splitters
+python-dotenv
+sentence_transformers
+chromadb
+langchain_groq
+streamlit
+pypdf
+fastapi
+uvicorn
+langserve
