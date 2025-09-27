@@ -1,5 +1,6 @@
 import streamlit as st
 import os
+import shutil
 from dotenv import load_dotenv
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -15,43 +16,55 @@ from langchain.chains.history_aware_retriever import create_history_aware_retrie
 from langchain_groq import ChatGroq
 import uuid
 
-
+# 🔑 Load API keys
 load_dotenv()
 os.environ["GROQ_API_KEY"] = os.getenv("GROQ_API_KEY")
-os.environ["LANGCHAIN_API_KEY"]=os.getenv("LANGCHAIN_API_KEY")
-os.environ["LANGCHAIN_TRACING_V2"]="true"
-os.environ["LANGCHAIN_PROJECT"]="Conversation with pdf"
+os.environ["LANGCHAIN_API_KEY"] = os.getenv("LANGCHAIN_API_KEY")
+os.environ["LANGCHAIN_TRACING_V2"] = "true"
+os.environ["LANGCHAIN_PROJECT"] = "Conversation with pdf"
 
+# Temporary directory for PDFs
+TEMP_DIR = "temp_pdfs"
+if not os.path.exists(TEMP_DIR):
+    os.makedirs(TEMP_DIR)
 
+# Streamlit UI setup
 st.set_page_config(page_title="Chat with your PDF", page_icon="📄", layout="wide")
-
 st.markdown("<h2 style='text-align: center;'>📄 Chat with Your PDF</h2>", unsafe_allow_html=True)
 st.divider()
 
+# Sidebar
 with st.sidebar:
     st.header("⚙️ Upload & Settings")
     file = st.file_uploader("Upload a PDF file", type="pdf")
     st.info("💡 Ask anything about your uploaded PDF. If not in the PDF, I'll use outside knowledge (marked as **Outside Context**).")
 
-    
-
+# If file uploaded
 if file:
-    # Reset everything if a new file is uploaded
+    # Reset and delete all previous PDFs if new one is uploaded
     if "last_uploaded" not in st.session_state or st.session_state.last_uploaded != file.name:
+        # 🗑️ Clear entire temp folder
+        if os.path.exists(TEMP_DIR):
+            shutil.rmtree(TEMP_DIR)
+        os.makedirs(TEMP_DIR)
+
+        # Reset states
         st.session_state.vector = None
         st.session_state.messages = []
         st.session_state.store = {}
-        st.session_state.last_uploaded = file.name   # track current file
-        st.session_state.session_id = str(uuid.uuid4()) 
+        st.session_state.last_uploaded = file.name
+        st.session_state.session_id = str(uuid.uuid4())
+
+        # Save new file
+        new_file_path = os.path.join(TEMP_DIR, f"{st.session_state.session_id}.pdf")
+        with open(new_file_path, "wb") as f:
+            f.write(file.getvalue())
+
+        st.session_state.last_file_path = new_file_path
 
     with st.spinner("Processing your PDF......."):
         if st.session_state.vector is None:
-            unique_filename = f"temp_{st.session_state.session_id}.pdf"
-            with open(unique_filename, "wb") as f:
-                f.write(file.getvalue())
-
-            loader = PyPDFLoader(unique_filename)
-
+            loader = PyPDFLoader(st.session_state.last_file_path)
             pdf = loader.load()
 
             text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
@@ -59,12 +72,10 @@ if file:
 
             embeddings = HuggingFaceBgeEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
             st.session_state.vector = Chroma.from_documents(split, embedding=embeddings)
-            st.write(f"Currently loaded file: {st.session_state.last_uploaded}")
-
 
         retriever = st.session_state.vector.as_retriever()
 
-        
+        # ---------------- Retriever Prompt ----------------
         system_prompt_retriever = """
         You are a helpful assistant that reformulates user questions based on chat history 
         to improve document retrieval.
@@ -83,6 +94,7 @@ if file:
             ("human", human_prompt_retriever)
         ])
 
+        # ---------------- QA Prompt ----------------
         system_prompt_qa = """
         You are given a context and a user query.
 
@@ -110,13 +122,13 @@ if file:
             ("human", human_prompt_qa)
         ])
 
+        # ---------------- Chain Setup ----------------
         llm = ChatGroq(model_name="gemma2-9b-it")
         history_aware_retriever = create_history_aware_retriever(llm, retriever, retriever_prompt)
         qa_chain = create_stuff_documents_chain(llm, qa_prompt)
         retrieval_chain = create_retrieval_chain(history_aware_retriever, qa_chain)
 
-    
-
+        # Session history manager
         def get_session_history(session_id: str) -> BaseChatMessageHistory:
             if session_id not in st.session_state.store:
                 st.session_state.store[session_id] = ChatMessageHistory()
@@ -130,13 +142,9 @@ if file:
             output_messages_key="answer"
         )
 
-
         config = {"configurable": {"session_id": st.session_state.session_id}}
 
-
-    
-    
-
+    # ---------------- Chat Display ----------------
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
@@ -146,10 +154,12 @@ if file:
         with st.chat_message("user"):
             st.markdown(query)
 
-
         response = final_chain.invoke({"input": query}, config=config)
         answer = response["answer"]
 
         st.session_state.messages.append({"role": "assistant", "content": answer})
         with st.chat_message("assistant"):
             st.markdown(answer)
+
+        # Debug: confirm which file is being used
+        st.write(f"✅ Currently loaded file: {st.session_state.last_uploaded}")
