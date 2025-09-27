@@ -42,13 +42,16 @@ if file:
         st.session_state.messages = []
         st.session_state.store = {}
         st.session_state.last_uploaded = file.name   # track current file
+        st.session_state.session_id = str(uuid.uuid4()) 
 
     with st.spinner("Processing your PDF......."):
         if st.session_state.vector is None:
-            with open("file.pdf", "wb") as f:
+            unique_filename = f"temp_{st.session_state.session_id}.pdf"
+            with open(unique_filename, "wb") as f:
                 f.write(file.getvalue())
 
-            loader = PyPDFLoader("file.pdf")
+            loader = PyPDFLoader(unique_filename)
+
             pdf = loader.load()
 
             text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
@@ -56,6 +59,8 @@ if file:
 
             embeddings = HuggingFaceBgeEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
             st.session_state.vector = Chroma.from_documents(split, embedding=embeddings)
+            st.write(f"Currently loaded file: {st.session_state.last_uploaded}")
+
 
         retriever = st.session_state.vector.as_retriever()
 
@@ -125,9 +130,6 @@ if file:
             output_messages_key="answer"
         )
 
-
-        if "session_id" not in st.session_state:
-            st.session_state.session_id = str(uuid.uuid4())  # random unique ID
 
         config = {"configurable": {"session_id": st.session_state.session_id}}
 
