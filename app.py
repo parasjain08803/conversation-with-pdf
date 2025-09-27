@@ -33,9 +33,18 @@ with st.sidebar:
     file = st.file_uploader("Upload a PDF file", type="pdf")
     st.info("💡 Ask anything about your uploaded PDF. If not in the PDF, I'll use outside knowledge (marked as **Outside Context**).")
 
+    
+
 if file:
+    # Reset everything if a new file is uploaded
+    if "last_uploaded" not in st.session_state or st.session_state.last_uploaded != file.name:
+        st.session_state.vector = None
+        st.session_state.messages = []
+        st.session_state.store = {}
+        st.session_state.last_uploaded = file.name   # track current file
+
     with st.spinner("Processing your PDF......."):
-        if "vector" not in st.session_state:
+        if st.session_state.vector is None:
             with open("file.pdf", "wb") as f:
                 f.write(file.getvalue())
 
@@ -101,8 +110,7 @@ if file:
         qa_chain = create_stuff_documents_chain(llm, qa_prompt)
         retrieval_chain = create_retrieval_chain(history_aware_retriever, qa_chain)
 
-        if "store" not in st.session_state:
-            st.session_state.store = {}
+    
 
         def get_session_history(session_id: str) -> BaseChatMessageHistory:
             if session_id not in st.session_state.store:
@@ -125,8 +133,7 @@ if file:
 
 
     
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
+    
 
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
