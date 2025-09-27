@@ -13,6 +13,7 @@ from langchain_community.chat_message_histories import ChatMessageHistory
 from langchain.chains.retrieval import create_retrieval_chain
 from langchain.chains.history_aware_retriever import create_history_aware_retriever
 from langchain_groq import ChatGroq
+import uuid
 
 
 load_dotenv()
@@ -115,7 +116,13 @@ if file:
             history_messages_key="chat_history",
             output_messages_key="answer"
         )
-        config = {"configurable": {"session_id": "chat1"}}
+
+
+        if "session_id" not in st.session_state:
+            st.session_state.session_id = str(uuid.uuid4())  # random unique ID
+
+        config = {"configurable": {"session_id": st.session_state.session_id}}
+
 
     
     if "messages" not in st.session_state:
