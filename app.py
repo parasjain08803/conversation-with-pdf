@@ -123,7 +123,7 @@ if file:
         ])
 
         # ---------------- Chain Setup ----------------
-        llm = ChatGroq(model_name="meta-llama/llama-prompt-guard-2-86m")
+        llm = ChatGroq(model_name="qwen/qwen3-32b")
         history_aware_retriever = create_history_aware_retriever(llm, retriever, retriever_prompt)
         qa_chain = create_stuff_documents_chain(llm, qa_prompt)
         retrieval_chain = create_retrieval_chain(history_aware_retriever, qa_chain)
