@@ -2,6 +2,8 @@ langchain
 ipykernel
 langchain_community
 langchain-text-splitters
+langchain_huggingface
+langchain_chroma
 python-dotenv
 sentence_transformers
 chromadb
@@ -11,3 +13,5 @@ pypdf
 fastapi
 uvicorn
 langserve
+python-multipart
+aiofiles

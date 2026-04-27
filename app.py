@@ -1,165 +1,271 @@
-import streamlit as st
 import os
+import tempfile
 import shutil
+from typing import List, Dict, Any
+import logging
+
+import streamlit as st
 from dotenv import load_dotenv
+
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain.embeddings import HuggingFaceBgeEmbeddings
-from langchain.vectorstores import Chroma
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.chat_history import BaseChatMessageHistory
-from langchain.chains.combine_documents import create_stuff_documents_chain
-from langchain_core.runnables.history import RunnableWithMessageHistory
-from langchain_community.chat_message_histories import ChatMessageHistory
-from langchain.chains.retrieval import create_retrieval_chain
-from langchain.chains.history_aware_retriever import create_history_aware_retriever
+
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_chroma import Chroma
+
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.runnables import RunnableLambda, RunnableWithMessageHistory
+from langchain_core.chat_history import InMemoryChatMessageHistory
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.documents import Document
+
 from langchain_groq import ChatGroq
-import uuid
 
-# 🔑 Load API keys
 load_dotenv()
-os.environ["GROQ_API_KEY"] = os.getenv("GROQ_API_KEY")
-os.environ["LANGCHAIN_API_KEY"] = os.getenv("LANGCHAIN_API_KEY")
-os.environ["LANGCHAIN_TRACING_V2"] = "true"
-os.environ["LANGCHAIN_PROJECT"] = "Conversation with pdf"
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# Temporary directory for PDFs
-TEMP_DIR = "temp_pdfs"
-if not os.path.exists(TEMP_DIR):
-    os.makedirs(TEMP_DIR)
+st.set_page_config(page_title="Chat with PDF", page_icon="📄", layout="centered")
+st.title("📄 Chat with Your PDF")
 
-# Streamlit UI setup
-st.set_page_config(page_title="Chat with your PDF", page_icon="📄", layout="wide")
-st.markdown("<h2 style='text-align: center;'>📄 Chat with Your PDF</h2>", unsafe_allow_html=True)
-st.divider()
-
-# Sidebar
 with st.sidebar:
-    st.header("⚙️ Upload & Settings")
-    file = st.file_uploader("Upload a PDF file", type="pdf")
-    st.info("💡 Ask anything about your uploaded PDF. If not in the PDF, I'll use outside knowledge (marked as **Outside Context**).")
-
-# If file uploaded
-if file:
-    # Reset and delete all previous PDFs if new one is uploaded
-    if "last_uploaded" not in st.session_state or st.session_state.last_uploaded != file.name:
-        # 🗑️ Clear entire temp folder
-        if os.path.exists(TEMP_DIR):
-            shutil.rmtree(TEMP_DIR)
-        os.makedirs(TEMP_DIR)
-
-        # Reset states
-        st.session_state.vector = None
+    st.header("📊 Document Info")
+    if "doc_info" in st.session_state:
+        st.write(f"**File:** {st.session_state.doc_info.get('name', 'N/A')}")
+        st.write(f"**Pages:** {st.session_state.doc_info.get('pages', 'N/A')}")
+        st.write(f"**Chunks:** {st.session_state.doc_info.get('chunks', 'N/A')}")
+    
+    st.header("⚙️ Settings")
+    chunk_size = st.slider("Chunk Size", 500, 2000, 1000)
+    chunk_overlap = st.slider("Chunk Overlap", 50, 500, 200)
+    
+    st.header("🔧 Actions")
+    if st.button("Clear Conversation"):
         st.session_state.messages = []
-        st.session_state.store = {}
-        st.session_state.last_uploaded = file.name
-        st.session_state.session_id = str(uuid.uuid4())
+        if st.session_state.session_id in st.session_state.store:
+            st.session_state.store[st.session_state.session_id] = InMemoryChatMessageHistory()
+        st.rerun()
+    
+    if st.button("Reset All"):
+        for key in list(st.session_state.keys()):
+            del st.session_state[key]
+        st.rerun()
 
-        # Save new file
-        new_file_path = os.path.join(TEMP_DIR, f"{st.session_state.session_id}.pdf")
-        with open(new_file_path, "wb") as f:
-            f.write(file.getvalue())
+uploaded = st.file_uploader("Upload a PDF file", type="pdf")
 
-        st.session_state.last_file_path = new_file_path
+if "chain" not in st.session_state:
+    st.session_state.chain = None
 
-    with st.spinner("Processing your PDF......."):
-        if st.session_state.vector is None:
-            loader = PyPDFLoader(st.session_state.last_file_path)
-            pdf = loader.load()
+if "messages" not in st.session_state:
+    st.session_state.messages = []
 
-            text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-            split = text_splitter.split_documents(pdf)
+if "session_id" not in st.session_state:
+    st.session_state.session_id = "user_1"
 
-            embeddings = HuggingFaceBgeEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-            st.session_state.vector = Chroma.from_documents(split, embedding=embeddings)
+if "current_file_name" not in st.session_state:
+    st.session_state.current_file_name = None
 
-        retriever = st.session_state.vector.as_retriever()
+if "doc_info" not in st.session_state:
+    st.session_state.doc_info = {}
+if "store" not in st.session_state:
+    st.session_state.store = {}
 
-        # ---------------- Retriever Prompt ----------------
-        system_prompt_retriever = """
-        You are a helpful assistant that reformulates user questions based on chat history 
-        to improve document retrieval.
-        """
-        human_prompt_retriever = """
-        Conversation history:
-        {chat_history}
 
-        User's question:
-        {input}
+def process_pdf(uploaded_file, chunk_size: int, chunk_overlap: int) -> Dict[str, Any]:
+    """Process uploaded PDF and return document info and retriever."""
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+            tmp.write(uploaded_file.read())
+            tmp_path = tmp.name
 
-        Reformulated standalone question:
-        """
-        retriever_prompt = ChatPromptTemplate.from_messages([
-            ("system", system_prompt_retriever),
-            ("human", human_prompt_retriever)
-        ])
-
-        # ---------------- QA Prompt ----------------
-        system_prompt_qa = """
-        You are given a context and a user query.
-
-        1. First, try to answer using only the provided context.
-        2. If the context does not contain enough information, do **not** refuse or apologize. Instead, answer the query using outside knowledge.
-        3. When you use outside knowledge, clearly mark it with: **“(Outside Context)”** before giving that part of the answer.
-        4. Never say “the context does not contain this.” Always either answer from context or provide outside knowledge with the marker.
-
-        Keep the answer clear, concise, and user-friendly.
-        """
-        human_prompt_qa = """
-        Conversation history:
-        {chat_history}
-
-        User's question:
-        {input}
-
-        Relevant context from documents:
-        {context}
-
-        Answer:
-        """
-        qa_prompt = ChatPromptTemplate.from_messages([
-            ("system", system_prompt_qa),
-            ("human", human_prompt_qa)
-        ])
-
-        # ---------------- Chain Setup ----------------
-        llm = ChatGroq(model_name="qwen/qwen3-32b")
-        history_aware_retriever = create_history_aware_retriever(llm, retriever, retriever_prompt)
-        qa_chain = create_stuff_documents_chain(llm, qa_prompt)
-        retrieval_chain = create_retrieval_chain(history_aware_retriever, qa_chain)
-
-        # Session history manager
-        def get_session_history(session_id: str) -> BaseChatMessageHistory:
-            if session_id not in st.session_state.store:
-                st.session_state.store[session_id] = ChatMessageHistory()
-            return st.session_state.store[session_id]
-
-        final_chain = RunnableWithMessageHistory(
-            retrieval_chain,
-            get_session_history,
-            input_messages_key="input",
-            history_messages_key="chat_history",
-            output_messages_key="answer"
+        loader = PyPDFLoader(tmp_path)
+        docs = loader.load()
+        
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap
         )
+        chunks = splitter.split_documents(docs)
+        
+        embeddings = HuggingFaceEmbeddings(
+            model_name="sentence-transformers/all-MiniLM-L6-v2"
+        )
+        vectorstore = Chroma.from_documents(chunks, embedding=embeddings)
+        retriever = vectorstore.as_retriever()
+        
+        os.unlink(tmp_path)
+        
+        return {
+            "docs": docs,
+            "chunks": chunks,
+            "retriever": retriever,
+            "pages": len(docs),
+            "num_chunks": len(chunks)
+        }
+        
+    except Exception as e:
+        logger.error(f"Error processing PDF: {str(e)}")
+        st.error(f"Error processing PDF: {str(e)}")
+        return None
 
-        config = {"configurable": {"session_id": st.session_state.session_id}}
 
-    # ---------------- Chat Display ----------------
-    for msg in st.session_state.messages:
-        with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
+if uploaded:
+    settings_changed = (
+        st.session_state.chain is None
+        or st.session_state.current_file_name != uploaded.name
+    )
+    
+    if settings_changed:
+        st.session_state.current_file_name = uploaded.name
+        st.session_state.messages = []
+        
+        with st.spinner("Processing your PDF ........"):
+            result = process_pdf(uploaded, chunk_size, chunk_overlap)
+            
+            if result is None:
+                st.error("Failed to process PDF. Please try again.")
+                st.stop()
+            
+            st.session_state.doc_info = {
+                "name": uploaded.name,
+                "pages": result["pages"],
+                "chunks": result["num_chunks"]
+            }
+            
+            retriever = result["retriever"]
+            
+            llm = ChatGroq(model_name="qwen/qwen3-32b")
 
-    if query := st.chat_input("💬 Ask a question about your PDF"):
-        st.session_state.messages.append({"role": "user", "content": query})
+            rewrite_prompt = ChatPromptTemplate.from_messages([
+                (
+                    "system",
+                    "Rewrite the user's question as a standalone question using the chat history."
+                ),
+                MessagesPlaceholder("chat_history"),
+                ("human", "{input}"),
+            ])
+
+            question_rewriter = (
+                rewrite_prompt
+                | llm
+                | StrOutputParser()
+            )
+
+            def retrieve_with_history(inputs: dict):
+                """inputs: {'input': str, 'chat_history': list[BaseMessage]}"""
+                standalone_q = question_rewriter.invoke(inputs)
+                docs = retriever.invoke(standalone_q)
+                return docs
+
+            retrieve_runnable = RunnableLambda(retrieve_with_history)
+
+            qa_prompt = ChatPromptTemplate.from_messages([
+                (
+                    "system",
+                    """
+You are a helpful assistant.
+
+Use ONLY the given context to answer when possible.
+If the context is not enough, use your outside knowledge but clearly mark it with **(Outside Context)**.
+Never say that the context does not contain the information; either answer from context, or add outside knowledge with the marker.and give only content skip complete think tag.
+                    """,
+                ),
+                MessagesPlaceholder("chat_history"),
+                (
+                    "human",
+                    """
+Question: {input}
+
+Context:
+{context}
+
+Answer:
+                    """,
+                ),
+            ])
+
+            base_chain = (
+                {
+                    "context": retrieve_runnable,
+                    "chat_history": lambda x: x["chat_history"],
+                    "input": lambda x: x["input"],
+                }
+                | qa_prompt
+                | llm
+                | StrOutputParser()
+            )
+
+            def get_history(session_id: str) -> InMemoryChatMessageHistory:
+                if session_id not in st.session_state.store:
+                    st.session_state.store[session_id] = InMemoryChatMessageHistory()
+                return st.session_state.store[session_id]
+
+            final_chain = RunnableWithMessageHistory(
+                base_chain,
+                get_history,
+                input_messages_key="input",
+                history_messages_key="chat_history",
+            )
+
+            st.session_state.chain = final_chain
+
+        st.success(f"✅ Loaded: {st.session_state.current_file_name}")
+    else:
+        st.success(f"✅ Already loaded: {st.session_state.current_file_name}")
+else:
+    st.info("👆 Please upload a PDF file to start chatting.")
+    
+
+chain = st.session_state.chain
+
+for msg in st.session_state.messages:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
+
+if chain is not None:
+    if user_input := st.chat_input("Ask something about your PDF..."):
+        st.session_state.messages.append({"role": "user", "content": user_input})
         with st.chat_message("user"):
-            st.markdown(query)
+            st.markdown(user_input)
 
-        response = final_chain.invoke({"input": query}, config=config)
-        answer = response["answer"]
+        try:
+            with st.spinner("Thinking..."):
+                answer = chain.invoke(
+                    {"input": user_input},
+                    config={"configurable": {"session_id": st.session_state.session_id}},
+                )
 
-        st.session_state.messages.append({"role": "assistant", "content": answer})
-        with st.chat_message("assistant"):
-            st.markdown(answer)
+            st.session_state.messages.append({"role": "assistant", "content": answer})
+            with st.chat_message("assistant"):
+                st.markdown(answer)
+                
+        except Exception as e:
+            logger.error(f"Error generating response: {str(e)}")
+            st.error(f"Error generating response: {str(e)}")
+            
+            error_msg = f"Sorry, I encountered an error: {str(e)}"
+            st.session_state.messages.append({"role": "assistant", "content": error_msg})
+            with st.chat_message("assistant"):
+                st.markdown(error_msg)
 
-        # Debug: confirm which file is being used
-        st.write(f"✅ Currently loaded file: {st.session_state.last_uploaded}")
+if st.session_state.chain is not None:
+    st.markdown("---")
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        if st.button("📥 Export Chat"):
+            chat_export = "\n".join([f"{msg['role'].upper()}: {msg['content']}" for msg in st.session_state.messages])
+            st.download_button(
+                label="Download Chat History",
+                data=chat_export,
+                file_name="chat_history.txt",
+                mime="text/plain"
+            )
+    
+    with col2:
+        message_count = len(st.session_state.messages)
+        st.metric("Messages", message_count)
+    
+    with col3:
+        if "doc_info" in st.session_state and st.session_state.doc_info:
+            st.metric("Document Chunks", st.session_state.doc_info.get("chunks", 0))
